@@ -29,9 +29,10 @@ CREATE TABLE IF NOT EXISTS devices (
     powered_on  INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS blobs (
-    device_id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
     slot      TEXT NOT NULL,
-    content   BLOB NOT NULL
+    content   BLOB NOT NULL,
+    PRIMARY KEY (device_id, slot)
 );
 """
 
@@ -50,6 +51,36 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._migrate_blobs()
+
+    def _migrate_blobs(self) -> None:
+        """Upgrade the early single-row-per-device blobs layout, if present.
+
+        The original schema keyed ``blobs`` by ``device_id`` alone, so staging a
+        candidate physically overwrote the active slot's image. Recreate the
+        table keyed by ``(device_id, slot)`` and carry each surviving row over
+        under the slot it was last tagged with. Fresh databases need no change.
+        """
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='blobs'"
+        ).fetchone()
+        ddl = (row["sql"] if row else "") or ""
+        if "PRIMARY KEY (device_id, slot)" in ddl:
+            return
+        self._conn.executescript(
+            """
+            ALTER TABLE blobs RENAME TO blobs_legacy;
+            CREATE TABLE blobs (
+                device_id TEXT NOT NULL,
+                slot      TEXT NOT NULL,
+                content   BLOB NOT NULL,
+                PRIMARY KEY (device_id, slot)
+            );
+            INSERT OR IGNORE INTO blobs (device_id, slot, content)
+            SELECT device_id, COALESCE(slot, 'A'), content FROM blobs_legacy;
+            DROP TABLE blobs_legacy;
+            """
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -138,28 +169,43 @@ class Store:
         conn.execute(
             """
             INSERT INTO blobs (device_id, slot, content) VALUES (?, ?, ?)
-            ON CONFLICT(device_id) DO UPDATE SET
-                slot=excluded.slot,
-                content=excluded.content
+            ON CONFLICT(device_id, slot) DO UPDATE SET content=excluded.content
             """,
             (device_id, slot, content),
         )
 
+    def read_blob(
+        self, conn: sqlite3.Connection, device_id: str, slot: str
+    ) -> Optional[bytes]:
+        """Return the persisted image bytes of one slot (never cross-read)."""
+        row = conn.execute(
+            "SELECT content FROM blobs WHERE device_id=? AND slot=?",
+            (device_id, slot),
+        ).fetchone()
+        return None if row is None else bytes(row["content"])
+
+    def slot_blob_length(
+        self, conn: sqlite3.Connection, device_id: str, slot: str
+    ) -> int:
+        row = conn.execute(
+            "SELECT length(content) AS n FROM blobs WHERE device_id=? AND slot=?",
+            (device_id, slot),
+        ).fetchone()
+        return 0 if row is None or row["n"] is None else int(row["n"])
+
     def append_blob(
         self, conn: sqlite3.Connection, device_id: str, slot: str, chunk: bytes
     ) -> int:
-        """Persist a streaming write; returns the new total byte count."""
+        """Persist a streaming write to one slot; returns the new byte count."""
         row = conn.execute(
-            "SELECT content FROM blobs WHERE device_id=?",
-            (device_id,),
+            "SELECT content FROM blobs WHERE device_id=? AND slot=?",
+            (device_id, slot),
         ).fetchone()
-        content = (row["content"] if row else b"") + chunk
+        content = (bytes(row["content"]) if row else b"") + chunk
         conn.execute(
             """
             INSERT INTO blobs (device_id, slot, content) VALUES (?, ?, ?)
-            ON CONFLICT(device_id) DO UPDATE SET
-                slot=excluded.slot,
-                content=excluded.content
+            ON CONFLICT(device_id, slot) DO UPDATE SET content=excluded.content
             """,
             (device_id, slot, content),
         )

@@ -158,6 +158,12 @@ def evidence(device_id: str) -> dict:
     return {"evidence": dev.evidence, "recovery_history": [r.to_dict() for r in dev.recovery_history]}
 
 
+@app.get("/api/devices/{device_id}/slot-images")
+def slot_images(device_id: str) -> dict:
+    # Diagnostic: re-measure every slot's own persisted image vs its manifest.
+    return service.slot_image_report(device_id)
+
+
 def mount_static() -> None:
     dist = Path(__file__).resolve().parent.parent / "web" / "dist"
     if dist.is_dir():

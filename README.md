@@ -3,8 +3,9 @@
 模拟轨道载荷维护员的启动镜像升级流程。核心安全保证：
 
 - **任意时点断电都不会引导摘要不符或未确认的候选**；
+- **候选暂存只写非活动槽自身的镜像行，绝不触碰当前活动槽的实际内容**——恢复时逐槽复核「自身持久化镜像实测摘要 == 清单摘要」与确认代次；
 - **新版本生效后永不回退**（旧槽位标记 `SUPERSEDED`，恢复时永不选择）；
-- 恢复时**仅从「清单完整且已确认」的槽位中选定唯一活动槽位**，并展示逐槽诊断证据与裁决理由；
+- 恢复时**仅从「镜像完整、实测摘要与清单一致且按当前代次确认」的槽位中选定唯一活动槽位**，并展示逐槽诊断证据与裁决理由；
 - 两个页面并发提交不同候选时，**仅一个请求取得当前代次的升级资格**，另一个得到稳定 `409` 且不改写活动版本。
 
 ## 架构
@@ -13,11 +14,12 @@
 backend/          FastAPI 服务
   models.py       槽位/设备/恢复报告领域模型（EMPTY→CANDIDATE→VERIFIED→CONFIRMED / REJECTED / SUPERSEDED）
   versioning.py   点分数字版本比较（候选必须严格更高）
-  store.py        SQLite(WAL) 持久化：槽位清单、候选阶段、确认代次、资格令牌、诊断证据、镜像 BLOB
-  service.py      升级编排：代次资格、摘要校验、原子确认切换、断电恢复裁决
+  store.py        SQLite(WAL) 持久化：槽位清单、候选阶段、确认代次、资格令牌、诊断证据、每槽独立镜像 BLOB（含旧库迁移）
+  service.py      升级编排：代次资格、摘要校验、原子确认切换、断电恢复裁决（逐槽实测镜像摘要）
   api.py          HTTP API + 托管 web/dist 静态页面
 web/              Vite 原生 JS 前端（中文界面，全部操作经真实 API）
-tests/            pytest（14 个用例：三种断电、损坏候选、并发裁决、防回退、重开一致）
+tests/            pytest（21 个用例：三种断电、损坏候选、并发裁决、防回退、重开一致、
+                     逐槽实际镜像摘要在三个候选阶段保持不变、已受损数据拒绝引导、旧库迁移）
 scripts/
   verify.sh       一次性验收：pytest → 构建页面 → 真实 uvicorn → HTTP 冒烟
   smoke_http.py   断电恢复与并发裁决的 HTTP 冒烟（63 条断言）
@@ -34,8 +36,9 @@ docker-compose.yml
 | 摘要校验 `digest_check` | 字节写完但校验结论未提交，`actual_digest` 为空 | 诊断 `unverified_candidate`，不升级 |
 | 确认切换 `confirm_switch` | 候选仍 `VERIFIED`（未确认），代次不变 | 诊断 `unconfirmed_candidate`，引导旧版本；恢复后仍可再确认 |
 | 镜像损坏 | 清单摘要 ≠ 实测摘要，槽位 `REJECTED`，证据保留 | 诊断 `digest_mismatch`，永不引导 |
+| 已确认槽镜像被替换/部分写 | 恢复时实测摘要 ≠ 清单摘要（或缺字节），槽位降为 `REJECTED` | 诊断 `active_image_corrupt`，拒绝错误引导且不回退到已淘汰版本；后续打开持续拒绝 |
 
-所有变更在 SQLite `BEGIN IMMEDIATE` 事务内完成，`COMMIT` 是唯一原子切换点；并发提交由数据库写锁串行化后再做代次资格裁决，因此冲突结果稳定。
+每个槽的镜像字节存放在 `blobs` 表中以 `(device_id, slot)` 为主键的独立行：候选流式写入只追加到**非活动槽自身的行**，结构上不可能覆盖当前活动槽的镜像。所有变更在 SQLite `BEGIN IMMEDIATE` 事务内完成，`COMMIT` 是唯一原子切换点；并发提交由数据库写锁串行化后再做代次资格裁决，因此冲突结果稳定。
 
 ## 快速开始（Docker Compose）
 
@@ -58,7 +61,7 @@ docker compose run --rm verify
 
 1. `pytest` 代码测试；
 2. `npm run build` 构建页面；
-3. 启动**真实 uvicorn**，对三种断电恢复、损坏候选、并发 409 裁决、切换后重开一致性进行 HTTP 冒烟；
+3. 启动**真实 uvicorn**，对三种断电恢复、损坏候选、并发 409 裁决、切换后重开一致性，以及三个候选阶段中旧槽实际镜像摘要不变、已受损数据拒绝引导进行 HTTP 冒烟；
 4. 执行完毕**自行退出**，全部通过退出码为 0，任一失败非 0。
 
 ## 本地开发（无 Docker）
@@ -92,3 +95,4 @@ bash scripts/verify.sh
 | POST | `/api/devices/{id}/confirm` | 确认切换（`fault_point=confirm_switch` 可注入断电） |
 | POST | `/api/devices/{id}/power-off` / `power-on` | 模拟断电 / 重新打开（执行恢复裁决） |
 | GET | `/api/devices/{id}/evidence` | 诊断证据与历次恢复报告 |
+| GET | `/api/devices/{id}/slot-images` | 逐槽复核：各槽自身持久化镜像的实测摘要/长度与清单是否一致（只读诊断） |

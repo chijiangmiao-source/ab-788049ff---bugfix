@@ -7,6 +7,8 @@ first failed expectation.
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 import sys
 import threading
 import urllib.error
@@ -51,6 +53,66 @@ def power_cycle(dev, expected_slot, expected_gen):
     return rec, d
 
 
+def images(dev):
+    _, body = call("GET", f"/api/devices/{dev}/slot-images", expect=200)
+    return body
+
+
+def assert_active_untouched(img, slot, expected_digest):
+    s = img["slots"][slot]
+    assert_that(s["status"] == "CONFIRMED", f"{slot} must stay CONFIRMED")
+    assert_that(s["measured_digest"] == expected_digest,
+                f"{slot} actual image digest changed to {s['measured_digest']}")
+    assert_that(s["digest_matches"] is True, f"{slot} digest no longer matches manifest")
+    assert_that(s["content_complete"] is True, f"{slot} image no longer complete")
+
+
+def clobber_blob(db_path, dev, slot, content):
+    """Overwrite one slot's durable bytes out-of-band.
+
+    Emulates data that was *already affected* before this open: the manifest
+    still claims the confirmed digest while the stored image is foreign.
+    """
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(
+            "UPDATE blobs SET content=? WHERE device_id=? AND slot=?",
+            (content, dev, slot),
+        )
+        assert conn.total_changes >= 1, "blob row to clobber not found"
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def check_previously_affected_data():
+    db_path = os.environ.get("DATA_PATH")
+    call("POST", "/api/devices", {"device_id": "s3", "version": "1.0.0"}, 201)
+    assert db_path, "DATA_PATH must point at the server's SQLite file"
+    call("POST", "/api/devices/s3/power-off", {}, 200)
+    # While off, damage the active slot's actual image after it was confirmed.
+    clobber_blob(db_path, "s3", "A", b"foreign-or-partial-candidate-bytes")
+
+    _, body = call("POST", "/api/devices/s3/power-on", {}, 200)
+    rec, d = body["recovery"], body["device"]
+    assert_that(body["outcome"] == "unbootable", "mismatched active image must refuse boot")
+    assert_that(rec["active_slot"] is None, "no slot may be selected from a corrupt active image")
+    diag_a = next(x for x in rec["diagnoses"] if x["slot"] == "A")
+    assert_that(diag_a["reason"] == "active_image_corrupt",
+                f"want active_image_corrupt, got {diag_a['reason']}")
+    assert_that(d["slots"]["A"]["status"] == "REJECTED", "damaged confirmed slot must be REJECTED")
+    img = images("s3")["slots"]["A"]
+    assert_that(img["digest_matches"] is False, "measured digest must not match manifest")
+
+    # Persisted refusal: a later open still rejects it (never silently boots).
+    call("POST", "/api/devices/s3/power-off", {}, 200)
+    _, body = call("POST", "/api/devices/s3/power-on", {}, 200)
+    assert_that(body["recovery"]["active_slot"] is None, "reopen must still refuse boot")
+    again = next(x for x in body["recovery"]["diagnoses"] if x["slot"] == "A")
+    assert_that(again["reason"] == "digest_mismatch", "reopen must keep digest_mismatch refusal")
+
+
 def main() -> int:
     # --- health + built page ------------------------------------------------
     _, health = call("GET", "/api/health", expect=200)
@@ -62,6 +124,8 @@ def main() -> int:
 
     # --- power-loss scenarios on device s1 ----------------------------------
     call("POST", "/api/devices", {"device_id": "s1", "version": "1.0.0"}, 201)
+    # Record the active slot's actual persisted image digest before staging.
+    active_digest = images("s1")["slots"]["A"]["measured_digest"]
 
     # fault 1: cut during candidate write -> incomplete, old slot boots
     _, b = call("POST", "/api/devices/s1/candidate",
@@ -72,6 +136,7 @@ def main() -> int:
     diag = {x["slot"]: x for x in rec["diagnoses"]}
     assert_that(diag["B"]["reason"] == "incomplete_write", "want incomplete_write diagnosis")
     assert_that(d["slots"]["B"]["written"] < d["slots"]["B"]["size"], "partial write expected")
+    assert_active_untouched(images("s1"), "A", active_digest)
 
     # fault 2: cut during digest check -> fully written but unproven
     _, b = call("POST", "/api/devices/s1/candidate",
@@ -81,6 +146,7 @@ def main() -> int:
     diag = {x["slot"]: x for x in rec["diagnoses"]}
     assert_that(diag["B"]["reason"] == "unverified_candidate", "want unverified_candidate")
     assert_that(d["slots"]["B"]["actual_digest"] is None, "no verdict may be committed")
+    assert_active_untouched(images("s1"), "A", active_digest)
 
     # corrupt candidate -> REJECTED, evidence kept, never boots
     _, b = call("POST", "/api/devices/s1/candidate",
@@ -89,6 +155,7 @@ def main() -> int:
     assert_that(b["claimed_digest"] != b["actual_digest"], "digests must differ")
     rec, d = power_cycle("s1", "A", 1)
     assert_that(d["slots"]["B"]["status"] == "REJECTED", "corrupt slot must stay REJECTED")
+    assert_active_untouched(images("s1"), "A", active_digest)
 
     # normal stage, fault 3: cut at confirm -> old version, candidate unconfirmed
     call("POST", "/api/devices/s1/candidate",
@@ -97,6 +164,7 @@ def main() -> int:
     assert_that(b["outcome"] == "power_cut", "confirm_switch fault not injected")
     rec, d = power_cycle("s1", "A", 1)
     assert_that(d["slots"]["B"]["status"] == "VERIFIED", "candidate remains VERIFIED")
+    assert_active_untouched(images("s1"), "A", active_digest)
 
     # commit for real -> B active, generation 2, no rollback after reopen
     _, b = call("POST", "/api/devices/s1/confirm", {}, 200)
@@ -107,7 +175,15 @@ def main() -> int:
     assert_that(d["slots"]["B"]["digest"] == digest_b, "reopen digest mismatch")
     assert_that(d["slots"]["A"]["status"] == "SUPERSEDED", "old slot must be SUPERSEDED")
     assert_that(any("防回退" in x for x in rec["rationale"]), "no-rollback rationale missing")
+    new_img = images("s1")["slots"]["B"]
+    assert_that(new_img["status"] == "CONFIRMED" and new_img["digest_matches"] is True,
+                "new active slot must be CONFIRMED with measured digest matching manifest")
+    assert_that(new_img["measured_digest"] == digest_b
+                and new_img["confirmed_generation"] == 2,
+                "new active content/digest/generation inconsistent after reopen")
 
+    # --- previously affected durable data is safely refused (no rollback) ----
+    check_previously_affected_data()
     # --- concurrent different candidates on device s2 -----------------------
     call("POST", "/api/devices", {"device_id": "s2", "version": "1.0.0"}, 201)
     barrier = threading.Barrier(2)

@@ -32,7 +32,8 @@ test -f "$ROOT/web/dist/index.html"
 cd "$ROOT"
 
 echo "==> [3/4] start real HTTP server on :$SMOKE_PORT"
-DATA_PATH="$TMPDIR_RUN/upgrade.db" "$PY" -m uvicorn backend.api:app \
+export DATA_PATH="$TMPDIR_RUN/upgrade.db"
+"$PY" -m uvicorn backend.api:app \
   --host 127.0.0.1 --port "$SMOKE_PORT" --log-level warning &
 SERVER_PID=$!
 
