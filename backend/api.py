@@ -85,6 +85,16 @@ def _device_view(device_id: str) -> dict:
     dev = service.get_device(device_id)
     body = dev.to_dict()
     body["powered_on"] = store.is_powered_on(device_id)
+    # Re-measure each slot's own persisted image so callers can audit that the
+    # bytes on flash really match the manifest, independently of status.
+    for name, slot in body["slots"].items():
+        image = store.get_blob(device_id, name)
+        slot["stored_size"] = len(image) if image is not None else None
+        slot["stored_digest"] = sha256_hex(image) if image is not None else None
+        slot["stored_matches_manifest"] = (
+            image is not None and slot["digest"] is not None
+            and slot["stored_digest"] == slot["digest"]
+        )
     return body
 
 

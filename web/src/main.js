@@ -113,14 +113,22 @@ function statusBadge(slot) {
 
 function renderSlot(slot) {
   const active = slot.name === state.device.active_slot;
-  return h('div', { class: `slot ${active ? 'active' : ''}` },
+  const mismatch = slot.digest != null && slot.stored_digest != null
+    && slot.stored_digest !== slot.digest;
+  return h('div', { class: `slot ${active ? 'active' : ''} ${mismatch ? 'corrupt' : ''}` },
     h('h4', {}, `槽位 ${slot.name}`,
       active ? h('span', { class: 'active-tag' }, '● 活动槽位（正在引导）') : statusBadge(slot)),
+    mismatch
+      ? h('div', { class: 'flash err' }, '持久化镜像与清单摘要不符：恢复时将拒绝此槽位引导，且不会回退到已淘汰版本。')
+      : null,
     h('div', { class: 'kv' },
       h('div', {}, h('b', {}, '状态'), slot.status),
       h('div', {}, h('b', {}, '版本'), slot.version ?? '—'),
       h('div', {}, h('b', {}, '清单摘要'), h('span', { class: 'mono' }, slot.digest ?? '—')),
       h('div', {}, h('b', {}, '实测摘要'), h('span', { class: 'mono' }, slot.actual_digest ?? '—')),
+      h('div', {}, h('b', {}, '持久化镜像摘要'), h('span', { class: 'mono' }, slot.stored_digest ?? '—（无镜像）')),
+      h('div', {}, h('b', {}, '持久化长度'), slot.stored_size == null ? '—' : `${slot.stored_size} 字节`),
+      h('div', {}, h('b', {}, '镜像与清单一致'), String(slot.stored_matches_manifest === true)),
       h('div', {}, h('b', {}, '写入进度'), slot.size == null ? '出厂预置' : `${slot.written}/${slot.size} 字节`),
       h('div', {}, h('b', {}, '确认代次'), slot.confirmed_generation ?? '—'),
       h('div', {}, h('b', {}, '清单完整'), String(slot.manifest_complete)),

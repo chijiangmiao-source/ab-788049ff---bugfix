@@ -74,6 +74,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   position: relative;
 }
 .slot.active { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok) inset; }
+.slot.corrupt { border-color: #b04a52; box-shadow: 0 0 0 1px #b04a52 inset; }
 .slot h4 { margin: 0 0 10px; display: flex; justify-content: space-between; }
 .badge {
   font-size: 11px; padding: 2px 8px; border-radius: 10px;

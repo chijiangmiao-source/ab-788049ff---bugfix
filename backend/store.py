@@ -6,7 +6,10 @@ power cut is reported:
 * the full slot roster (A/B) with stage, version, claimed/measured digest,
 * the candidate staging progress (``written`` bytes),
 * the confirmation generation and the qualification token,
-* append-only diagnostic evidence.
+* append-only diagnostic evidence,
+* **each slot's own image bytes in a separate ``(device_id, slot) row** --
+  staging a candidate into the inactive slot can never overwrite the active
+  slot's persisted image.
 
 Mutations run under ``BEGIN IMMEDIATE`` so concurrent candidate submissions are
 serialised by SQLite itself; the service layer then applies the generation
@@ -15,6 +18,7 @@ qualification rule on the freshly read row.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -29,11 +33,17 @@ CREATE TABLE IF NOT EXISTS devices (
     powered_on  INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS blobs (
-    device_id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
     slot      TEXT NOT NULL,
-    content   BLOB NOT NULL
+    content   BLOB NOT NULL,
+    PRIMARY KEY (device_id, slot)
 );
 """
+
+# Matches a composite primary key on (device_id, slot), tolerating whitespace.
+_COMPOSITE_PK = re.compile(
+    r"primary\s+key\s*\(\s*device_id\s*,\s*slot\s*\)", re.IGNORECASE
+)
 
 
 class Store:
@@ -50,10 +60,54 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._migrate_blob_schema()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # ------------------------------------------------------------------ #
+    def _migrate_blob_schema(self) -> None:
+        """Upgrade databases created by the early single-blob-per-device schema.
+
+        The original ``blobs`` table keyed rows by ``device_id`` alone, so
+        writing a candidate into the inactive slot silently replaced the
+        active slot's image while its manifest kept claiming the old digest.
+        Such a database is copied row by row into the composite-key layout;
+        recovery then re-measures every slot and refuses any slot whose
+        persisted content cannot be verified (no guesswork, no rollback).
+        """
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='blobs'"
+        ).fetchone()
+        if row is not None and _COMPOSITE_PK.search(row["sql"] or ""):
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                """
+                CREATE TABLE blobs_v2 (
+                    device_id TEXT NOT NULL,
+                    slot      TEXT NOT NULL,
+                    content   BLOB NOT NULL,
+                    PRIMARY KEY (device_id, slot)
+                )
+                """
+            )
+            # One row per device under the old key; keep it tagged with the
+            # slot it was last written for and let recovery adjudicate it.
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO blobs_v2 (device_id, slot, content)
+                SELECT device_id, slot, content FROM blobs
+                """
+            )
+            self._conn.execute("DROP TABLE blobs")
+            self._conn.execute("ALTER TABLE blobs_v2 RENAME TO blobs")
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     # ------------------------------------------------------------------ #
     def list_device_ids(self) -> list[str]:
@@ -94,6 +148,11 @@ class Store:
     def load_all(self) -> list[Device]:
         return [self.load(did) for did in self.list_device_ids()]
 
+    def get_blob(self, device_id: str, slot: str) -> Optional[bytes]:
+        """Read one slot's persisted image outside a transaction (tests/diag)."""
+        with self._lock:
+            return self.read_blob(self._conn, device_id, slot)
+
     # ------------------------------------------------------------------ #
     def transaction(self):
         """Context manager yielding a fresh in-transaction connection.
@@ -132,14 +191,23 @@ class Store:
             (1 if powered_on else 0, device_id),
         )
 
+    @staticmethod
+    def read_blob(
+        conn: sqlite3.Connection, device_id: str, slot: str
+    ) -> Optional[bytes]:
+        row = conn.execute(
+            "SELECT content FROM blobs WHERE device_id=? AND slot=?",
+            (device_id, slot),
+        ).fetchone()
+        return row["content"] if row is not None else None
+
     def write_blob(
         self, conn: sqlite3.Connection, device_id: str, slot: str, content: bytes
     ) -> None:
         conn.execute(
             """
             INSERT INTO blobs (device_id, slot, content) VALUES (?, ?, ?)
-            ON CONFLICT(device_id) DO UPDATE SET
-                slot=excluded.slot,
+            ON CONFLICT(device_id, slot) DO UPDATE SET
                 content=excluded.content
             """,
             (device_id, slot, content),
@@ -148,17 +216,13 @@ class Store:
     def append_blob(
         self, conn: sqlite3.Connection, device_id: str, slot: str, chunk: bytes
     ) -> int:
-        """Persist a streaming write; returns the new total byte count."""
-        row = conn.execute(
-            "SELECT content FROM blobs WHERE device_id=?",
-            (device_id,),
-        ).fetchone()
-        content = (row["content"] if row else b"") + chunk
+        """Persist a streaming write to one slot; returns the new byte count."""
+        previous = self.read_blob(conn, device_id, slot) or b""
+        content = previous + chunk
         conn.execute(
             """
             INSERT INTO blobs (device_id, slot, content) VALUES (?, ?, ?)
-            ON CONFLICT(device_id) DO UPDATE SET
-                slot=excluded.slot,
+            ON CONFLICT(device_id, slot) DO UPDATE SET
                 content=excluded.content
             """,
             (device_id, slot, content),

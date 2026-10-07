@@ -2,9 +2,11 @@
 
 模拟轨道载荷维护员的启动镜像升级流程。核心安全保证：
 
+- **槽位存储隔离**：每个槽位的镜像字节以独立的 `(device_id, slot)` 行持久化；向未活动槽写入任何尚未确认/损坏/中断的候选，都不会改变当前活动槽的实际镜像；
+- **恢复以字节为准、不信清单**：上电时对每个槽位**自身持久化的镜像重新测量摘要**并核对确认记录（状态 CONFIRMED、确认代次为当前代次）；镜像缺失、部分写入或摘要不符的槽位一律拒绝引导；
 - **任意时点断电都不会引导摘要不符或未确认的候选**；
-- **新版本生效后永不回退**（旧槽位标记 `SUPERSEDED`，恢复时永不选择）；
-- 恢复时**仅从「清单完整且已确认」的槽位中选定唯一活动槽位**，并展示逐槽诊断证据与裁决理由；
+- **新版本生效后永不回退**（旧槽位标记 `SUPERSEDED`，恢复时永不选择；即使当前活动镜像受损也不回退，而是安全拒绝引导）；
+- 恢复时**仅从「自身镜像完整可复核 且 已确认且确认代次一致」的槽位中选定唯一活动槽位**，并展示逐槽诊断证据与裁决理由；
 - 两个页面并发提交不同候选时，**仅一个请求取得当前代次的升级资格**，另一个得到稳定 `409` 且不改写活动版本。
 
 ## 架构
@@ -13,14 +15,14 @@
 backend/          FastAPI 服务
   models.py       槽位/设备/恢复报告领域模型（EMPTY→CANDIDATE→VERIFIED→CONFIRMED / REJECTED / SUPERSEDED）
   versioning.py   点分数字版本比较（候选必须严格更高）
-  store.py        SQLite(WAL) 持久化：槽位清单、候选阶段、确认代次、资格令牌、诊断证据、镜像 BLOB
-  service.py      升级编排：代次资格、摘要校验、原子确认切换、断电恢复裁决
-  api.py          HTTP API + 托管 web/dist 静态页面
+  store.py        SQLite(WAL) 持久化：槽位清单、候选阶段、确认代次、资格令牌、诊断证据；镜像 BLOB 按 (设备,槽位) 独立存储，含旧库迁移
+  service.py      升级编排：槽位存储隔离、恢复逐槽重测镜像摘要、代次资格、原子确认切换、断电恢复裁决
+  api.py          HTTP API + 托管 web/dist 静态页面（设备视图含每槽持久化镜像摘要 stored_digest）
 web/              Vite 原生 JS 前端（中文界面，全部操作经真实 API）
-tests/            pytest（14 个用例：三种断电、损坏候选、并发裁决、防回退、重开一致）
+tests/            pytest（22 个用例：三种断电、损坏候选、并发裁决、防回退、重开一致、槽位镜像隔离与旧库拒绝）
 scripts/
-  verify.sh       一次性验收：pytest → 构建页面 → 真实 uvicorn → HTTP 冒烟
-  smoke_http.py   断电恢复与并发裁决的 HTTP 冒烟（63 条断言）
+  verify.sh       一次性验收：pytest → 构建页面 → 真实 uvicorn → HTTP 冒烟（91 条断言）
+  smoke_http.py   断电恢复、槽位字节隔离、并发裁决的 HTTP 冒烟
 Dockerfile        运行镜像（多阶段：Node 构建页面 + Python 运行）
 Dockerfile.verify 验收镜像（含 Node/Python，compose 中的 verify 服务）
 docker-compose.yml
@@ -30,10 +32,13 @@ docker-compose.yml
 
 | 故障点 | 断电时持久化状态 | 重新上电的裁决 |
 | --- | --- | --- |
-| 候选写入 `candidate_write` | 只落盘部分字节，槽位 `CANDIDATE`，`written < size` | 诊断 `incomplete_write`，继续引导旧槽 |
-| 摘要校验 `digest_check` | 字节写完但校验结论未提交，`actual_digest` 为空 | 诊断 `unverified_candidate`，不升级 |
-| 确认切换 `confirm_switch` | 候选仍 `VERIFIED`（未确认），代次不变 | 诊断 `unconfirmed_candidate`，引导旧版本；恢复后仍可再确认 |
-| 镜像损坏 | 清单摘要 ≠ 实测摘要，槽位 `REJECTED`，证据保留 | 诊断 `digest_mismatch`，永不引导 |
+| 候选写入 `candidate_write` | 只在候选槽落盘部分字节，槽位 `CANDIDATE`，`written < size`；**活动槽镜像字节不变** | 诊断 `incomplete_write`，逐槽重测后继续引导旧槽 |
+| 摘要校验 `digest_check` | 候选槽字节写完但校验结论未提交，`actual_digest` 为空；**活动槽镜像字节不变** | 诊断 `unverified_candidate`，不升级 |
+| 确认切换 `confirm_switch` | 候选仍 `VERIFIED`（未确认），代次不变；**活动槽镜像字节不变** | 诊断 `unconfirmed_candidate`，引导旧版本；恢复后仍可再确认 |
+| 活动镜像静默损坏 | 重测摘要与清单不符/字节缺失，槽位由 `CONFIRMED` 降级 `REJECTED`，证据保留 | 诊断 `image_unverifiable`，拒绝引导且**不回退**到 `SUPERSEDED` 旧版 |
+| 镜像损坏（候选） | 清单摘要 ≠ 实测摘要，槽位 `REJECTED`，证据保留 | 诊断 `digest_mismatch`，永不引导 |
+
+恢复裁决对**每个槽位**读取其独立持久化的镜像并重新计算 sha256：只有「字节完整（长度=清单长度）、实测摘要=清单摘要、状态 CONFIRMED、确认代次=当前代次」同时成立才合格；未确认、部分写入、损坏或中断的候选仅保留诊断证据。旧版单镜像行（按设备主键）数据库打开时自动迁移到复合主键布局，受影响数据在下次上电时重测识别并拒绝——不猜测、不引导、不借淘汰版本回退。
 
 所有变更在 SQLite `BEGIN IMMEDIATE` 事务内完成，`COMMIT` 是唯一原子切换点；并发提交由数据库写锁串行化后再做代次资格裁决，因此冲突结果稳定。
 
@@ -58,7 +63,7 @@ docker compose run --rm verify
 
 1. `pytest` 代码测试；
 2. `npm run build` 构建页面；
-3. 启动**真实 uvicorn**，对三种断电恢复、损坏候选、并发 409 裁决、切换后重开一致性进行 HTTP 冒烟；
+3. 启动**真实 uvicorn**，对三种断电恢复、三种候选阶段旧槽实际字节摘要等于清单、损坏候选（含活动槽静默损坏拒绝且不回退）、并发 409 裁决、切换后及下一次升级中断时当前活动槽内容/摘要/代次一致性进行 HTTP 冒烟；
 4. 执行完毕**自行退出**，全部通过退出码为 0，任一失败非 0。
 
 ## 本地开发（无 Docker）

@@ -61,7 +61,20 @@ def main() -> int:
                 "served page is not the built bundle")
 
     # --- power-loss scenarios on device s1 ----------------------------------
-    call("POST", "/api/devices", {"device_id": "s1", "version": "1.0.0"}, 201)
+    _, created = call("POST", "/api/devices",
+                      {"device_id": "s1", "version": "1.0.0"}, 201)
+    slot_a = created["device"]["slots"]["A"]
+    a_digest = slot_a["digest"]
+    assert_that(slot_a["stored_digest"] == a_digest
+                and slot_a["stored_matches_manifest"] is True,
+                "factory slot actual bytes must match its manifest")
+
+    def old_slot_bytes_intact(d, digest=a_digest):
+        sa = d["slots"]["A"]
+        assert_that(sa["stored_digest"] == digest,
+                    "active slot A actual content was altered by the candidate stage")
+        assert_that(sa["stored_matches_manifest"] is True,
+                    "active slot A stored bytes no longer match its manifest")
 
     # fault 1: cut during candidate write -> incomplete, old slot boots
     _, b = call("POST", "/api/devices/s1/candidate",
@@ -72,6 +85,7 @@ def main() -> int:
     diag = {x["slot"]: x for x in rec["diagnoses"]}
     assert_that(diag["B"]["reason"] == "incomplete_write", "want incomplete_write diagnosis")
     assert_that(d["slots"]["B"]["written"] < d["slots"]["B"]["size"], "partial write expected")
+    old_slot_bytes_intact(d)
 
     # fault 2: cut during digest check -> fully written but unproven
     _, b = call("POST", "/api/devices/s1/candidate",
@@ -81,6 +95,7 @@ def main() -> int:
     diag = {x["slot"]: x for x in rec["diagnoses"]}
     assert_that(diag["B"]["reason"] == "unverified_candidate", "want unverified_candidate")
     assert_that(d["slots"]["B"]["actual_digest"] is None, "no verdict may be committed")
+    old_slot_bytes_intact(d)
 
     # corrupt candidate -> REJECTED, evidence kept, never boots
     _, b = call("POST", "/api/devices/s1/candidate",
@@ -89,6 +104,7 @@ def main() -> int:
     assert_that(b["claimed_digest"] != b["actual_digest"], "digests must differ")
     rec, d = power_cycle("s1", "A", 1)
     assert_that(d["slots"]["B"]["status"] == "REJECTED", "corrupt slot must stay REJECTED")
+    old_slot_bytes_intact(d)
 
     # normal stage, fault 3: cut at confirm -> old version, candidate unconfirmed
     call("POST", "/api/devices/s1/candidate",
@@ -97,16 +113,43 @@ def main() -> int:
     assert_that(b["outcome"] == "power_cut", "confirm_switch fault not injected")
     rec, d = power_cycle("s1", "A", 1)
     assert_that(d["slots"]["B"]["status"] == "VERIFIED", "candidate remains VERIFIED")
+    old_slot_bytes_intact(d)
 
     # commit for real -> B active, generation 2, no rollback after reopen
     _, b = call("POST", "/api/devices/s1/confirm", {}, 200)
     assert_that(b["outcome"] == "switched" and b["generation"] == 2, "switch not committed")
+    assert_that(b["device"]["slots"]["B"]["stored_digest"] == b["device"]["slots"]["B"]["digest"]
+                and b["device"]["slots"]["B"]["confirmed_generation"] == 2,
+                "new active slot content/digest/generation inconsistent")
     digest_b = b["device"]["slots"]["B"]["digest"]
     rec, d = power_cycle("s1", "B", 2)
     assert_that(d["slots"]["B"]["version"] == "2.0.0", "reopen version mismatch")
     assert_that(d["slots"]["B"]["digest"] == digest_b, "reopen digest mismatch")
+    assert_that(d["slots"]["B"]["stored_digest"] == digest_b,
+                "reopen actual bytes do not match the confirmed manifest")
+    assert_that(d["slots"]["B"]["confirmed_generation"] == 2, "reopen generation mismatch")
     assert_that(d["slots"]["A"]["status"] == "SUPERSEDED", "old slot must be SUPERSEDED")
     assert_that(any("防回退" in x for x in rec["rationale"]), "no-rollback rationale missing")
+
+    # next upgrade (3.0.0 into A): until it commits, active slot B is preserved
+    _, b = call("POST", "/api/devices/s1/candidate",
+                {"version": "3.0.0", "request_id": "w5", "fault_point": "candidate_write"}, 200)
+    assert_that(b["outcome"] == "power_cut", "second-upgrade write fault not injected")
+    rec, d = power_cycle("s1", "B", 2)
+    assert_that(d["slots"]["B"]["stored_digest"] == digest_b,
+                "current active slot B was altered before the next switch committed")
+    call("POST", "/api/devices/s1/candidate",
+         {"version": "3.0.0", "request_id": "w6"}, 200)
+    _, b = call("POST", "/api/devices/s1/confirm", {}, 200)
+    assert_that(b["outcome"] == "switched" and b["generation"] == 3
+                and b["active_slot"] == "A", "second switch failed")
+    assert_that(b["device"]["slots"]["A"]["stored_digest"]
+                == b["device"]["slots"]["A"]["digest"],
+                "3.0.0 active slot bytes/digest inconsistent")
+    rec, d = power_cycle("s1", "A", 3)
+    assert_that(d["slots"]["A"]["confirmed_generation"] == 3
+                and d["slots"]["B"]["status"] == "SUPERSEDED",
+                "post-second-upgrade state inconsistent across reopen")
 
     # --- concurrent different candidates on device s2 -----------------------
     call("POST", "/api/devices", {"device_id": "s2", "version": "1.0.0"}, 201)

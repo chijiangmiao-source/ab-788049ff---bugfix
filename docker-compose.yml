@@ -21,9 +21,10 @@ services:
 
   # One-shot acceptance gate. Run with:
   #   docker compose run --rm verify
-  # It executes pytest, builds the page, smokes power-loss recovery and the
-  # concurrent-upgrade decision against the live `web` service, then exits
-  # with a non-zero code on any failure.
+  # It executes pytest, builds the page, boots a real uvicorn inside the verify
+  # container (isolated /tmp database) and smokes power-loss recovery, slot
+  # image isolation and the concurrent-upgrade decision over HTTP, then exits
+  # with code 0 on success and non-zero on any failure.
   verify:
     build:
       context: .
